@@ -113,7 +113,8 @@ export default function Home() {
             { type: "ai", text: reply, language: detectedLanguage, timestamp: new Date() },
           ]);
 
-          speakResponse(reply, detectedLanguage);
+          // Speak in chunks
+          speakTextInChunks(reply, detectedLanguage);
         } catch (error) {
           console.error("Error processing audio:", error);
         } finally {
@@ -139,17 +140,41 @@ export default function Home() {
     }
   };
 
-  const speakResponse = (text: string, lang: string) => {
-    setIsSpeaking(true);
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = lang || "en-US";
-    utter.rate = 0.9;
-    utter.pitch = 1.1;
+  // Helper: Split long text into smaller chunks and speak them sequentially
+  const speakTextInChunks = (fullText: string, langCode: string) => {
+    window.speechSynthesis.cancel(); // stop any ongoing speech
 
-    utter.onend = () => setIsSpeaking(false);
-    utter.onerror = () => setIsSpeaking(false);
+    // Ensure the browser TTS engine recognizes a valid locale (fallback if needed):
+    let utterLang: string;
+    if (langCode.startsWith("es")) utterLang = "es-ES";
+    else if (langCode.startsWith("fr")) utterLang = "fr-FR";
+    else if (langCode.startsWith("pt")) utterLang = "pt-PT";
+    else if (langCode.startsWith("it")) utterLang = "it-IT";
+    else if (langCode.startsWith("ru")) utterLang = "ru-RU";
+    else if (langCode.startsWith("ja")) utterLang = "ja-JP";
+    else utterLang = "en-US";
 
-    window.speechSynthesis.speak(utter);
+    // Split text into chunks of ~150 characters (without breaking words abruptly)
+    const chunkSize = 150;
+    const regex = new RegExp(`(.|\\s){1,${chunkSize}}(?=\\s|$)`, "g");
+    const chunks = fullText.match(regex) || [fullText];
+
+    const speakChunk = (index: number) => {
+      if (index >= chunks.length) return;
+      setIsSpeaking(true);
+      const utter = new SpeechSynthesisUtterance(chunks[index]);
+      utter.lang = utterLang;
+      utter.rate = 0.9;
+      utter.pitch = 1.1;
+      utter.onend = () => {
+        // Speak next chunk once this one finishes
+        speakChunk(index + 1);
+      };
+      window.speechSynthesis.speak(utter);
+    };
+
+    // Start with the first chunk
+    speakChunk(0);
   };
 
   const stopSpeaking = () => {
@@ -825,7 +850,7 @@ export default function Home() {
                   </button>
                 ) : (
                   <button
-                    onClick={() => speakResponse(aiReply, language)}
+                    onClick={() => speakTextInChunks(aiReply, language)}
                     style={{ ...styles.actionButton, ...styles.speakButton }}
                   >
                     <VolumeIcon className="w-4 h-4" />
@@ -876,13 +901,13 @@ export default function Home() {
         {showSettings && (
           <div
             style={styles.modal}
-            onClick={(e) => {
-              if (e.target === e.currentTarget) setShowSettings(false);
+            onClick={(e: React.MouseEvent<HTMLDivElement>) => {
+              if (e.currentTarget === e.target) setShowSettings(false);
             }}
           >
             <div
               style={styles.modalContent}
-              onClick={(e) => e.stopPropagation()}
+              onClick={(e: React.MouseEvent<HTMLDivElement>) => e.stopPropagation()}
             >
               <h3 style={styles.modalTitle}>Settings</h3>
               <div style={styles.settingsGrid}>
