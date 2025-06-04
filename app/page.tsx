@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect } from "react";
+import styles from "./page.module.css";
 
 // Define a type for each conversation item
 type ConversationItem = {
@@ -11,6 +12,7 @@ type ConversationItem = {
 };
 
 export default function Home() {
+  // Conversation and voice-assistant states
   const [isRecording, setIsRecording] = useState(false);
   const [userText, setUserText] = useState("");
   const [language, setLanguage] = useState("");
@@ -22,53 +24,41 @@ export default function Home() {
   const [conversationHistory, setConversationHistory] = useState<ConversationItem[]>([]);
   const [showSettings, setShowSettings] = useState(false);
 
-  // Refs with proper initial values
+  // Refs for audio handling
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
+  // On mount: restore theme only
   useEffect(() => {
-    // Check for saved theme preference
     const savedTheme = localStorage.getItem("eternals-theme");
     if (savedTheme === "dark") {
       setDarkMode(true);
     }
   }, []);
 
-  const toggleTheme = () => {
-    setDarkMode(!darkMode);
-    localStorage.setItem("eternals-theme", !darkMode ? "dark" : "light");
-  };
+  // Called when user clicks the mic button (requests permission & records)
+  const handleMicClick = async () => {
+    if (isRecording || isProcessing) return;
 
-  const analyzeAudio = () => {
-    if (!analyserRef.current) return;
-
-    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
-    analyserRef.current.getByteFrequencyData(dataArray);
-
-    const average = dataArray.reduce((acc, val) => acc + val, 0) / dataArray.length;
-    setRecordingLevel(average / 128);
-
-    if (isRecording) {
-      const frameId = requestAnimationFrame(analyzeAudio);
-      animationFrameRef.current = frameId;
+    try {
+      // Always attempt to getUserMedia on click
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      beginRecordingWithStream(stream);
+    } catch (err) {
+      console.warn("Microphone access denied or unavailable:", err);
+      alert(
+        "🔴 Cannot access microphone. Please allow microphone access in your browser settings and try again."
+      );
     }
   };
 
-  const startRecording = async () => {
+  // Actually start recording using the provided MediaStream
+  const beginRecordingWithStream = async (stream: MediaStream) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      // Setup audio analysis
-      audioContextRef.current = new AudioContext();
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      source.connect(analyserRef.current);
-      analyserRef.current.fftSize = 256;
-
-      const mediaRecorder = new MediaRecorder(stream);
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
@@ -78,12 +68,12 @@ export default function Home() {
 
       mediaRecorder.onstop = async () => {
         setIsProcessing(true);
-        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/mp3" });
+        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
         const formData = new FormData();
-        formData.append("audio", audioBlob);
+        formData.append("audio", audioBlob, "recording.webm");
 
         try {
-          // Whisper API call
+          // 1) Whisper transcription call
           const whisperRes = await fetch("/api/whisper", {
             method: "POST",
             body: formData,
@@ -95,7 +85,7 @@ export default function Home() {
           setUserText(text);
           setLanguage(detectedLanguage);
 
-          // GPT API call
+          // 2) GPT API call
           const gptRes = await fetch("/api/ask", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -106,14 +96,14 @@ export default function Home() {
 
           setAiReply(reply);
 
-          // Add to conversation history
+          // 3) Add to conversation history
           setConversationHistory((prev) => [
             ...prev,
             { type: "user", text, language: detectedLanguage, timestamp: new Date() },
             { type: "ai", text: reply, language: detectedLanguage, timestamp: new Date() },
           ]);
 
-          // Speak in chunks
+          // 4) Speak the AI reply
           speakTextInChunks(reply, detectedLanguage);
         } catch (error) {
           console.error("Error processing audio:", error);
@@ -122,11 +112,18 @@ export default function Home() {
         }
       };
 
+      // Start recording & set up the visualizer
       mediaRecorder.start();
       setIsRecording(true);
-      analyzeAudio();
 
-      // Stop after 10 seconds
+      audioContextRef.current = new AudioContext();
+      const sourceNode = audioContextRef.current.createMediaStreamSource(stream);
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      sourceNode.connect(analyserRef.current);
+      analyserRef.current.fftSize = 256;
+      animateVisualizer();
+
+      // Automatically stop after 10 seconds
       setTimeout(() => {
         mediaRecorder.stop();
         setIsRecording(false);
@@ -136,15 +133,30 @@ export default function Home() {
         setRecordingLevel(0);
       }, 10000);
     } catch (error) {
-      console.error("Error accessing microphone:", error);
+      console.error("Error starting MediaRecorder:", error);
+      alert("🔴 Failed to start recording. Please try again.");
+      setIsRecording(false);
     }
   };
 
-  // Helper: Split long text into smaller chunks and speak them sequentially
+  // Visualizer: animate audio levels
+  const animateVisualizer = () => {
+    if (!analyserRef.current) return;
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
+    const average = dataArray.reduce((acc, val) => acc + val, 0) / dataArray.length;
+    setRecordingLevel(average / 128);
+
+    if (isRecording) {
+      const frameId = requestAnimationFrame(animateVisualizer);
+      animationFrameRef.current = frameId;
+    }
+  };
+
+  // Helper: split long text into chunks & speak sequentially
   const speakTextInChunks = (fullText: string, langCode: string) => {
     window.speechSynthesis.cancel(); // stop any ongoing speech
 
-    // Ensure the browser TTS engine recognizes a valid locale (fallback if needed):
     let utterLang: string;
     if (langCode.startsWith("es")) utterLang = "es-ES";
     else if (langCode.startsWith("fr")) utterLang = "fr-FR";
@@ -154,26 +166,26 @@ export default function Home() {
     else if (langCode.startsWith("ja")) utterLang = "ja-JP";
     else utterLang = "en-US";
 
-    // Split text into chunks of ~150 characters (without breaking words abruptly)
     const chunkSize = 150;
     const regex = new RegExp(`(.|\\s){1,${chunkSize}}(?=\\s|$)`, "g");
     const chunks = fullText.match(regex) || [fullText];
 
     const speakChunk = (index: number) => {
-      if (index >= chunks.length) return;
+      if (index >= chunks.length) {
+        setIsSpeaking(false);
+        return;
+      }
       setIsSpeaking(true);
       const utter = new SpeechSynthesisUtterance(chunks[index]);
       utter.lang = utterLang;
       utter.rate = 0.9;
       utter.pitch = 1.1;
       utter.onend = () => {
-        // Speak next chunk once this one finishes
         speakChunk(index + 1);
       };
       window.speechSynthesis.speak(utter);
     };
 
-    // Start with the first chunk
     speakChunk(0);
   };
 
@@ -188,7 +200,7 @@ export default function Home() {
     setAiReply("");
   };
 
-  // Icons as SVG components
+  // SVG Icons (all fixed, no stray backticks)
   const MicIcon = ({ className = "w-6 h-6" }: { className?: string }) => (
     <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path
@@ -305,461 +317,75 @@ export default function Home() {
     </svg>
   );
 
-  // Styles object
-  const styles: Record<string, React.CSSProperties> = {
-    container: {
-      minHeight: "100vh",
-      background: darkMode
-        ? "linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%)"
-        : "linear-gradient(135deg, rgb(37, 50, 109) 0%, rgb(70, 10, 129) 100%)",
-      color: "#ffffff",
-      fontFamily: '"Segoe UI", system-ui, -apple-system, sans-serif',
-      position: "relative",
-      overflow: "hidden",
-    },
-    backgroundEffects: {
-      position: "fixed",
-      inset: 0,
-      overflow: "hidden",
-      pointerEvents: "none",
-      zIndex: 0,
-    },
-    floatingOrb: {
-      position: "absolute",
-      borderRadius: "50%",
-      filter: "blur(60px)",
-      opacity: 0.3,
-      animation: "float 20s ease-in-out infinite",
-    },
-    orb1: {
-      top: "10%",
-      right: "10%",
-      width: "300px",
-      height: "300px",
-      background:
-        "radial-gradient(circle, rgba(139, 92, 246, 0.3), rgba(59, 130, 246, 0.3))",
-      animationDelay: "0s",
-    },
-    orb2: {
-      bottom: "10%",
-      left: "10%",
-      width: "400px",
-      height: "400px",
-      background:
-        "radial-gradient(circle, rgba(236, 72, 153, 0.3), rgba(167, 243, 208, 0.3))",
-      animationDelay: "10s",
-    },
-    orb3: {
-      top: "50%",
-      left: "50%",
-      transform: "translate(-50%, -50%)",
-      width: "250px",
-      height: "250px",
-      background:
-        "radial-gradient(circle, rgba(34, 197, 94, 0.2), rgba(59, 130, 246, 0.2))",
-      animationDelay: "5s",
-    },
-    header: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      padding: "1.5rem",
-      position: "relative",
-      zIndex: 10,
-    },
-    logo: {
-      display: "flex",
-      alignItems: "center",
-      gap: "0.75rem",
-    },
-    logoIcon: {
-      width: "32px",
-      height: "32px",
-      borderRadius: "8px",
-      background: "linear-gradient(45deg, #8b5cf6, #06b6d4)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-    },
-    logoText: {
-      fontSize: "0.875rem",
-      fontWeight: "500",
-      opacity: 0.8,
-    },
-    headerButtons: {
-      display: "flex",
-      alignItems: "center",
-      gap: "1rem",
-    },
-    headerButton: {
-      padding: "0.5rem",
-      borderRadius: "8px",
-      background: "rgba(255, 255, 255, 0.1)",
-      border: "none",
-      color: "inherit",
-      cursor: "pointer",
-      transition: "all 0.2s ease",
-      backdropFilter: "blur(10px)",
-    },
-    main: {
-      maxWidth: "1024px",
-      margin: "0 auto",
-      padding: "0 1.5rem 2rem",
-      position: "relative",
-      zIndex: 10,
-    },
-    hero: {
-      textAlign: "center",
-      marginBottom: "3rem",
-    },
-    title: {
-      fontSize: "4rem",
-      fontWeight: "bold",
-      marginBottom: "1rem",
-      background: "linear-gradient(45deg, #8b5cf6, #06b6d4, #10b981)",
-      backgroundClip: "text",
-      WebkitBackgroundClip: "text",
-      color: "transparent",
-      textShadow: "0 0 30px rgba(139, 92, 246, 0.3)",
-    },
-    subtitle: {
-      fontSize: "1.25rem",
-      opacity: 0.9,
-      marginBottom: "1rem",
-    },
-    features: {
-      display: "flex",
-      justifyContent: "center",
-      alignItems: "center",
-      gap: "2rem",
-      fontSize: "0.875rem",
-      opacity: 0.7,
-      flexWrap: "wrap",
-    },
-    feature: {
-      display: "flex",
-      alignItems: "center",
-      gap: "0.5rem",
-    },
-    recordingInterface: {
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "center",
-      marginBottom: "2rem",
-    },
-    visualizer: {
-      display: "flex",
-      alignItems: "center",
-      gap: "2px",
-      marginBottom: "1.5rem",
-      height: "60px",
-    },
-    visualizerBar: {
-      width: "3px",
-      background: "linear-gradient(to top, #8b5cf6, #06b6d4)",
-      borderRadius: "2px",
-      transition: "all 0.1s ease",
-    },
-    recordButton: {
-      position: "relative",
-      width: "120px",
-      height: "120px",
-      borderRadius: "50%",
-      border: "4px solid",
-      background: "rgba(255, 255, 255, 0.05)",
-      backdropFilter: "blur(20px)",
-      cursor: "pointer",
-      transition: "all 0.3s ease",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      boxShadow: "0 20px 40px rgba(0, 0, 0, 0.1)",
-    },
-    recordButtonRecording: {
-      borderColor: "#ef4444",
-      background: "rgba(239, 68, 68, 0.1)",
-      transform: "scale(1.1)",
-      boxShadow: "0 0 30px rgba(239, 68, 68, 0.3)",
-    },
-    recordButtonProcessing: {
-      borderColor: "#f59e0b",
-      background: "rgba(245, 158, 11, 0.1)",
-      animation: "spin 2s linear infinite",
-    },
-    recordButtonNormal: {
-      borderColor: "#8b5cf6",
-      background: "rgba(139, 92, 246, 0.1)",
-    },
-    statusText: {
-      marginTop: "1rem",
-      fontSize: "0.875rem",
-      opacity: 0.8,
-      textAlign: "center",
-    },
-    conversationGrid: {
-      display: "grid",
-      gap: "1.5rem",
-      gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
-      marginBottom: "2rem",
-    },
-    conversationCard: {
-      background: "rgba(255, 255, 255, 0.08)",
-      backdropFilter: "blur(20px)",
-      borderRadius: "16px",
-      padding: "1.5rem",
-      border: "1px solid rgba(255, 255, 255, 0.1)",
-      boxShadow: "0 8px 32px rgba(0, 0, 0, 0.1)",
-    },
-    cardHeader: {
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      marginBottom: "0.75rem",
-    },
-    cardHeaderLeft: {
-      display: "flex",
-      alignItems: "center",
-      gap: "0.75rem",
-    },
-    avatar: {
-      width: "32px",
-      height: "32px",
-      borderRadius: "50%",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      fontSize: "0.875rem",
-      fontWeight: "bold",
-      color: "white",
-    },
-    userAvatar: {
-      background: "linear-gradient(45deg, #10b981, #3b82f6)",
-    },
-    aiAvatar: {
-      background: "linear-gradient(45deg, #8b5cf6, #ec4899)",
-    },
-    cardText: {
-      fontSize: "1.125rem",
-      lineHeight: "1.6",
-      margin: 0,
-    },
-    actionButton: {
-      padding: "0.5rem",
-      borderRadius: "8px",
-      border: "none",
-      cursor: "pointer",
-      transition: "all 0.2s ease",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-    },
-    speakButton: {
-      background: "rgba(59, 130, 246, 0.2)",
-      color: "#3b82f6",
-    },
-    stopButton: {
-      background: "rgba(239, 68, 68, 0.2)",
-      color: "#ef4444",
-    },
-    historySection: {
-      marginTop: "2rem",
-    },
-    historyHeader: {
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      marginBottom: "1rem",
-    },
-    historyTitle: {
-      fontSize: "1.125rem",
-      fontWeight: "600",
-      margin: 0,
-    },
-    clearButton: {
-      fontSize: "0.875rem",
-      padding: "0.5rem 1rem",
-      borderRadius: "8px",
-      background: "rgba(239, 68, 68, 0.2)",
-      color: "#ef4444",
-      border: "none",
-      cursor: "pointer",
-      transition: "all 0.2s ease",
-    },
-    historyContainer: {
-      background: "rgba(255, 255, 255, 0.05)",
-      backdropFilter: "blur(20px)",
-      borderRadius: "16px",
-      padding: "1rem",
-      border: "1px solid rgba(255, 255, 255, 0.1)",
-      maxHeight: "320px",
-      overflowY: "auto",
-    },
-    historyItem: {
-      display: "flex",
-      alignItems: "flex-start",
-      gap: "0.75rem",
-      marginBottom: "0.75rem",
-    },
-    historyBubble: {
-      maxWidth: "240px",
-      padding: "0.75rem",
-      borderRadius: "12px",
-    },
-    userBubble: {
-      background: "rgba(59, 130, 246, 0.2)",
-      marginLeft: "auto",
-    },
-    aiBubble: {
-      background: "rgba(139, 92, 246, 0.2)",
-    },
-    historyText: {
-      fontSize: "0.875rem",
-      margin: "0 0 0.25rem 0",
-    },
-    historyTime: {
-      fontSize: "0.75rem",
-      opacity: 0.6,
-    },
-    modal: {
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0, 0, 0, 0.5)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      zIndex: 50,
-      backdropFilter: "blur(4px)",
-    },
-    modalContent: {
-      background: darkMode
-        ? "rgba(31, 41, 55, 0.95)"
-        : "rgba(255, 255, 255, 0.95)",
-      backdropFilter: "blur(20px)",
-      borderRadius: "16px",
-      padding: "1.5rem",
-      maxWidth: "400px",
-      width: "90%",
-      margin: "1rem",
-      boxShadow: "0 20px 40px rgba(0, 0, 0, 0.2)",
-      border: "1px solid rgba(255, 255, 255, 0.1)",
-    },
-    modalTitle: {
-      fontSize: "1.25rem",
-      fontWeight: "bold",
-      marginBottom: "1rem",
-      color: darkMode ? "#ffffff" : "#1f2937",
-    },
-    settingsGrid: {
-      display: "grid",
-      gap: "1rem",
-    },
-    settingItem: {
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      padding: "0.75rem",
-      borderRadius: "8px",
-      background: "rgba(255, 255, 255, 0.05)",
-    },
-    settingLabel: {
-      fontSize: "0.875rem",
-      color: darkMode ? "#d1d5db" : "#374151",
-    },
-    closeButton: {
-      marginTop: "1rem",
-      width: "100%",
-      padding: "0.75rem",
-      borderRadius: "8px",
-      background: "linear-gradient(45deg, #8b5cf6, #06b6d4)",
-      color: "white",
-      border: "none",
-      cursor: "pointer",
-      fontSize: "0.875rem",
-      fontWeight: "500",
-    },
-  };
-
   return (
-    <div style={styles.container}>
-      {/* CSS Animations */}
-      <style>{`
-        @keyframes float {
-          0%, 100% { transform: translateY(0px) rotate(0deg); }
-          25% { transform: translateY(-20px) rotate(1deg); }
-          50% { transform: translateY(-10px) rotate(-1deg); }
-          75% { transform: translateY(-15px) rotate(0.5deg); }
-        }
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
-      `}</style>
-
-      {/* Background Effects */}
-      <div style={styles.backgroundEffects}>
-        <div style={{ ...styles.floatingOrb, ...styles.orb1 }} />
-        <div style={{ ...styles.floatingOrb, ...styles.orb2 }} />
-        <div style={{ ...styles.floatingOrb, ...styles.orb3 }} />
+    <div className={darkMode ? styles.containerDark : styles.container}>
+      {/* ==== Background Effects ==== */}
+      <div className={styles.backgroundEffects}>
+        <div className={`${styles.floatingOrb} ${styles.orb1}`} />
+        <div className={`${styles.floatingOrb} ${styles.orb2}`} />
+        <div className={`${styles.floatingOrb} ${styles.orb3}`} />
       </div>
 
-      {/* Header */}
-      <header style={styles.header}>
-        <div style={styles.logo}>
-          <div style={styles.logoIcon}>
+      {/* ==== Header ==== */}
+      <header className={styles.header}>
+        <div className={styles.logo}>
+          <div className={styles.logoIcon}>
             <ZapIcon className="w-5 h-5 text-white" />
           </div>
-          <span style={styles.logoText}>Eternals AI</span>
+          <span className={styles.logoText}>Eternals AI</span>
         </div>
 
-        <div style={styles.headerButtons}>
+        <div className={styles.headerButtons}>
           <button
             onClick={() => setShowSettings(!showSettings)}
-            style={styles.headerButton}
+            className={styles.headerButton}
           >
             <SettingsIcon className="w-5 h-5" />
           </button>
-          <button onClick={toggleTheme} style={styles.headerButton}>
+          <button
+            onClick={() => {
+              setDarkMode(!darkMode);
+              localStorage.setItem("eternals-theme", !darkMode ? "dark" : "light");
+            }}
+            className={styles.headerButton}
+          >
             {darkMode ? <SunIcon className="w-5 h-5" /> : <MoonIcon className="w-5 h-5" />}
           </button>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main style={styles.main}>
-        {/* Hero Section */}
-        <div style={styles.hero}>
-          <h1 style={styles.title}>Eternals</h1>
-          <p style={styles.subtitle}>Advanced AI Voice Assistant</p>
-          <div style={styles.features}>
-            <div style={styles.feature}>
+      {/* ==== Main Content ==== */}
+      <main className={styles.main}>
+        {/* --- Hero Section --- */}
+        <div className={styles.hero}>
+          <h1 className={styles.title}>Eternals</h1>
+          <p className={styles.subtitle}>Advanced AI Voice Assistant</p>
+          <div className={styles.features}>
+            <div className={styles.feature}>
               <GlobeIcon className="w-4 h-4" />
               <span>Multi-language Support</span>
             </div>
-            <div style={styles.feature}>
+            <div className={styles.feature}>
               <BrainIcon className="w-4 h-4" />
               <span>Neural Processing</span>
             </div>
-            <div style={styles.feature}>
+            <div className={styles.feature}>
               <MessageIcon className="w-4 h-4" />
               <span>Natural Conversation</span>
             </div>
           </div>
         </div>
 
-        {/* Recording Interface */}
-        <div style={styles.recordingInterface}>
+        {/* --- Recording Interface (click mic to request & record) --- */}
+        <div className={styles.recordingInterface}>
           {/* Audio Level Visualizer */}
           {isRecording && (
-            <div style={styles.visualizer}>
+            <div className={styles.visualizer}>
               {[...Array(20)].map((_, i) => (
                 <div
                   key={i}
+                  className={styles.visualizerBar}
                   style={{
-                    ...styles.visualizerBar,
                     height: `${Math.max(
                       4,
                       recordingLevel * 40 + Math.sin(Date.now() * 0.01 + i) * 10
@@ -771,19 +397,18 @@ export default function Home() {
             </div>
           )}
 
-          {/* Main Recording Button */}
+          {/* Mic Button: click to request permission & record */}
           <div>
             <button
-              onClick={startRecording}
-              disabled={isRecording || isProcessing}
-              style={{
-                ...styles.recordButton,
-                ...(isRecording
+              onClick={handleMicClick}
+              disabled={isProcessing}
+              className={`${styles.recordButton} ${
+                isRecording
                   ? styles.recordButtonRecording
                   : isProcessing
                   ? styles.recordButtonProcessing
-                  : styles.recordButtonNormal),
-              }}
+                  : styles.recordButtonNormal
+              }`}
             >
               <div
                 style={{
@@ -805,38 +430,38 @@ export default function Home() {
             </button>
           </div>
 
-          <p style={styles.statusText}>
-            {isRecording
-              ? "🎧 Listening... (10s max)"
-              : isProcessing
+          <p className={styles.statusText}>
+            {isProcessing
               ? "🧠 Processing your request..."
-              : "🎤 Tap to speak in any language"}
+              : isRecording
+              ? "🎧 Listening... (10s max)"
+              : "🎤 Tap the mic to speak"}
           </p>
         </div>
 
-        {/* Conversation Display */}
-        <div style={styles.conversationGrid}>
-          {/* User Input */}
+        {/* --- Conversation Display --- */}
+        <div className={styles.conversationGrid}>
+          {/* User Input Card */}
           {userText && (
-            <div style={styles.conversationCard}>
-              <div style={styles.cardHeader}>
-                <div style={styles.cardHeaderLeft}>
-                  <div style={{ ...styles.avatar, ...styles.userAvatar }}>You</div>
+            <div className={styles.conversationCard}>
+              <div className={styles.cardHeader}>
+                <div className={styles.cardHeaderLeft}>
+                  <div className={`${styles.avatar} ${styles.userAvatar}`}>You</div>
                   <span style={{ fontSize: "0.875rem", opacity: 0.7 }}>
                     {language && `Detected: ${language}`}
                   </span>
                 </div>
               </div>
-              <p style={styles.cardText}>{userText}</p>
+              <p className={styles.cardText}>{userText}</p>
             </div>
           )}
 
-          {/* AI Response */}
+          {/* AI Response Card */}
           {aiReply && (
-            <div style={styles.conversationCard}>
-              <div style={styles.cardHeader}>
-                <div style={styles.cardHeaderLeft}>
-                  <div style={{ ...styles.avatar, ...styles.aiAvatar }}>
+            <div className={styles.conversationCard}>
+              <div className={styles.cardHeader}>
+                <div className={styles.cardHeaderLeft}>
+                  <div className={`${styles.avatar} ${styles.aiAvatar}`}>
                     <ZapIcon className="w-4 h-4" />
                   </div>
                   <span style={{ fontSize: "0.875rem", opacity: 0.7 }}>Eternals AI</span>
@@ -844,50 +469,47 @@ export default function Home() {
                 {isSpeaking ? (
                   <button
                     onClick={stopSpeaking}
-                    style={{ ...styles.actionButton, ...styles.stopButton }}
+                    className={`${styles.actionButton} ${styles.stopButton}`}
                   >
                     <MicOffIcon className="w-4 h-4" />
                   </button>
                 ) : (
                   <button
                     onClick={() => speakTextInChunks(aiReply, language)}
-                    style={{ ...styles.actionButton, ...styles.speakButton }}
+                    className={`${styles.actionButton} ${styles.speakButton}`}
                   >
                     <VolumeIcon className="w-4 h-4" />
                   </button>
                 )}
               </div>
-              <p style={styles.cardText}>{aiReply}</p>
+              <p className={styles.cardText}>{aiReply}</p>
             </div>
           )}
         </div>
 
-        {/* Conversation History */}
+        {/* --- Conversation History --- */}
         {conversationHistory.length > 0 && (
-          <div style={styles.historySection}>
-            <div style={styles.historyHeader}>
-              <h3 style={styles.historyTitle}>Conversation History</h3>
-              <button onClick={clearConversation} style={styles.clearButton}>
+          <div className={styles.historySection}>
+            <div className={styles.historyHeader}>
+              <h3 className={styles.historyTitle}>Conversation History</h3>
+              <button onClick={clearConversation} className={styles.clearButton}>
                 Clear History
               </button>
             </div>
-            <div style={styles.historyContainer}>
+            <div className={styles.historyContainer}>
               {conversationHistory.map((item, index) => (
                 <div
                   key={index}
-                  style={{
-                    ...styles.historyItem,
-                    flexDirection: item.type === "ai" ? "row-reverse" : "row",
-                  }}
+                  className={styles.historyItem}
+                  style={{ flexDirection: item.type === "ai" ? "row-reverse" : "row" }}
                 >
                   <div
-                    style={{
-                      ...styles.historyBubble,
-                      ...(item.type === "user" ? styles.userBubble : styles.aiBubble),
-                    }}
+                    className={`${styles.historyBubble} ${
+                      item.type === "user" ? styles.userBubble : styles.aiBubble
+                    }`}
                   >
-                    <p style={styles.historyText}>{item.text}</p>
-                    <span style={styles.historyTime}>
+                    <p className={styles.historyText}>{item.text}</p>
+                    <span className={styles.historyTime}>
                       {item.timestamp.toLocaleTimeString()}
                     </span>
                   </div>
@@ -897,24 +519,31 @@ export default function Home() {
           </div>
         )}
 
-        {/* Settings Modal */}
+        {/* --- Settings Modal --- */}
         {showSettings && (
           <div
-            style={styles.modal}
+            className={styles.modal}
             onClick={(e: React.MouseEvent<HTMLDivElement>) => {
               if (e.currentTarget === e.target) setShowSettings(false);
             }}
           >
             <div
-              style={styles.modalContent}
+              className={darkMode ? styles.modalContentDark : styles.modalContent}
               onClick={(e: React.MouseEvent<HTMLDivElement>) => e.stopPropagation()}
             >
-              <h3 style={styles.modalTitle}>Settings</h3>
-              <div style={styles.settingsGrid}>
-                <div style={styles.settingItem}>
-                  <span style={styles.settingLabel}>Dark Mode</span>
+              <h3 className={darkMode ? styles.modalTitleDark : styles.modalTitle}>
+                Settings
+              </h3>
+              <div className={styles.settingsGrid}>
+                <div className={styles.settingItem}>
+                  <span className={darkMode ? styles.settingLabelDark : styles.settingLabel}>
+                    Dark Mode
+                  </span>
                   <button
-                    onClick={toggleTheme}
+                    onClick={() => {
+                      setDarkMode(!darkMode);
+                      localStorage.setItem("eternals-theme", !darkMode ? "dark" : "light");
+                    }}
                     style={{
                       padding: "0.25rem 0.75rem",
                       borderRadius: "6px",
@@ -930,8 +559,8 @@ export default function Home() {
                     {darkMode ? "ON" : "OFF"}
                   </button>
                 </div>
-                <div style={styles.settingItem}>
-                  <span style={styles.settingLabel}>Voice Feedback</span>
+                <div className={styles.settingItem}>
+                  <span className={styles.settingLabel}>Voice Feedback</span>
                   <button
                     style={{
                       padding: "0.25rem 0.75rem",
@@ -946,12 +575,12 @@ export default function Home() {
                     ON
                   </button>
                 </div>
-                <div style={styles.settingItem}>
-                  <span style={styles.settingLabel}>Recording Duration</span>
+                <div className={styles.settingItem}>
+                  <span className={styles.settingLabel}>Recording Duration</span>
                   <span style={{ fontSize: "0.75rem", opacity: 0.7 }}>10 seconds</span>
                 </div>
-                <div style={styles.settingItem}>
-                  <span style={styles.settingLabel}>Auto-Language Detection</span>
+                <div className={styles.settingItem}>
+                  <span className={styles.settingLabel}>Auto-Language Detection</span>
                   <button
                     style={{
                       padding: "0.25rem 0.75rem",
@@ -967,10 +596,7 @@ export default function Home() {
                   </button>
                 </div>
               </div>
-              <button
-                onClick={() => setShowSettings(false)}
-                style={styles.closeButton}
-              >
+              <button onClick={() => setShowSettings(false)} className={styles.closeButton}>
                 Close Settings
               </button>
             </div>
